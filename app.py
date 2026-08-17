@@ -22,16 +22,36 @@ def split_sentences(text):
     return [p for p in parts if p.strip()]
 
 def clone_paragraph(src_p, dst_doc):
-    """Copy paragraph XML trực tiếp, giữ runs và định dạng."""
-    body = dst_doc._body._element
-    new_p = deepcopy(src_p._p)
+    """
+    Tạo một paragraph MỚI thay vì chép nguyên XML của paragraph cũ.
+    Cách này tạo ra cấu trúc DOCX sạch:
+        <w:p>...</w:p>
+        <w:p>...</w:p>
+    để các website đọc Word vẫn nhận đúng từng đoạn.
+    Đồng thời cố gắng giữ style, định dạng paragraph và định dạng từng run.
+    """
+    new_p = dst_doc.add_paragraph()
 
-    # sectPr phải nằm cuối body.
-    sectPr = body.sectPr
-    if sectPr is not None:
-        body.insert(body.index(sectPr), new_p)
-    else:
-        body.append(new_p)
+    # Giữ style của paragraph nếu có.
+    try:
+        if src_p.style and src_p.style.name:
+            new_p.style = src_p.style.name
+    except Exception:
+        pass
+
+    # Sao chép paragraph properties (căn lề, thụt đầu dòng, giãn dòng...)
+    try:
+        if src_p._p.pPr is not None:
+            new_p._p.insert(0, deepcopy(src_p._p.pPr))
+    except Exception:
+        pass
+
+    # Sao chép từng run, không chép nguyên <w:p>.
+    # Nhờ vậy paragraph mới luôn là một <w:p> độc lập.
+    for run in src_p.runs:
+        new_p._p.append(deepcopy(run._r))
+
+    return new_p
 
 def clear_default_paragraph(doc):
     for p in list(doc.paragraphs):
@@ -141,6 +161,7 @@ def build_one_word_document(chunks):
             if kind == "paragraph":
                 clone_paragraph(obj, out)
             else:
+                # Câu được tách từ paragraph dài: tạo paragraph Word thật.
                 out.add_paragraph(obj)
 
     return out
