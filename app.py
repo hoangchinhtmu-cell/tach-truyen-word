@@ -1,149 +1,294 @@
-import streamlit as st
-from docx import Document
-from docx.oxml import OxmlElement
+import io
+import re
+import zipfile
 from copy import deepcopy
 from pathlib import Path
-import io, re, zipfile
 
-st.set_page_config(page_title="Tách truyện Word", page_icon="📖", layout="centered")
+import streamlit as st
+from docx import Document
 
-def wc(text):
-    return len(re.findall(r"\S+", text))
+st.set_page_config(
+    page_title="Tách truyện Word",
+    page_icon="📖",
+    layout="centered",
+)
 
-def copy_run_fragment(src_run, text, dst_p):
-    r = dst_p.add_run(text)
-    r._r.get_or_add_rPr().extend(deepcopy(src_run._r.rPr)) if src_run._r.rPr is not None else None
-    # copy run-level attributes such as rStyle/rFonts/etc via the full rPr
-    if src_run._r.rPr is not None:
-        old = r._r.rPr
-        for child in list(old):
-            old.remove(child)
-        for child in list(src_run._r.rPr):
-            old.append(deepcopy(child))
-    return r
+# ----------------------------
+# Helpers
+# ----------------------------
 
-def copy_para_properties(src_p, dst_p):
-    if src_p._p.pPr is not None:
-        dst_p._p.insert(0, deepcopy(src_p._p.pPr))
+WORD_RE = re.compile(r"\S+")
 
-def add_text_range_preserve_runs(src_p, start, end, out_doc, keep_empty=False):
-    dst_p = out_doc.add_paragraph()
-    # remove default pPr/runs if any
-    for child in list(dst_p._p):
-        if child.tag.endswith("}pPr"):
-            dst_p._p.remove(child)
-    copy_para_properties(src_p, dst_p)
+def word_count(text: str) -> int:
+    return len(WORD_RE.findall(text or ""))
 
-    pos=0
-    for run in src_p.runs:
-        t=run.text or ""
-        r0, r1 = pos, pos+len(t)
-        a=max(start,r0); b=min(end,r1)
-        if a < b:
-            copy_run_fragment(run, t[a-r0:b-r0], dst_p)
-        pos=r1
-    if keep_empty and not dst_p.text:
-        dst_p.add_run("")
-    return dst_p
-
-def sentence_units_for_paragraph(p):
-    text=p.text
+def split_sentences(text: str):
+    """
+    Tách câu tương đối an toàn, giữ nguyên nội dung.
+    Ưu tiên các dấu kết thúc câu tiếng Việt/Trung.
+    """
+    text = text or ""
     if not text.strip():
         return []
-    # Prefer sentence endings; newlines are also safe boundaries.
-    matches=list(re.finditer(r'[.!?。！？…]+(?=\s|$)|\n+', text))
-    units=[]
-    start=0
-    for m in matches:
-        end=m.end()
-        frag=text[start:end]
-        if frag.strip():
-            units.append((p,start,end,wc(frag)))
-        start=end
-    if start < len(text) and text[start:].strip():
-        units.append((p,start,len(text),wc(text[start:])))
-    return units
 
-def build_units(doc):
-    units=[]
-    for p in doc.paragraphs:
-        if not p.text.strip():
-            continue
-        units.extend(sentence_units_for_paragraph(p))
-    return units
+    # Giữ dấu câu cùng câu. Khoảng trắng sau dấu câu là điểm ngắt.
+    parts = re.split(r"(?<=[.!?。！？…])(?=\s+|$)", text)
+    return [p for p in parts if p.strip()]
 
-def make_chunk_doc(units):
-    out=Document()
-    # remove initial empty paragraph
-    if out.paragraphs:
-        p=out.paragraphs[0]
+def clone_paragraph(src_p, dst_doc):
+    """
+    Copy toàn bộ paragraph XML để giữ định dạng, runs, style,
+    alignment, spacing... tốt nhất có thể.
+    """
+    new_p = dst_doc.add_paragraph()
+    new_p._p.getparent().remove(new_p._p)
+    new_p._p.addnext(deepcopy(src_p._p))
+    return dst_doc.paragraphs[-1]
+
+def clear_default_paragraph(doc):
+    if doc.paragraphs:
+        p = doc.paragraphs[0]
         p._element.getparent().remove(p._element)
-    for src,start,end,_ in units:
-        add_text_range_preserve_runs(src,start,end,out)
+
+def make_doc_from_paragraphs(paragraphs):
+    out = Document()
+    clear_default_paragraph(out)
+    for p in paragraphs:
+        clone_paragraph(p, out)
     return out
 
-def split_units(units,target,min_w,max_w):
-    chunks=[]; cur=[]; n=0
-    for u in units:
-        w=u[3]
-        if cur and n+w > max_w:
-            chunks.append(cur); cur=[]; n=0
-        cur.append(u); n+=w
-        if n >= target and n >= min_w:
-            # Don't force exact target: the next sentence stays in the next chapter.
-            chunks.append(cur); cur=[]; n=0
-    if cur: chunks.append(cur)
+def add_text_paragraph(out, text):
+    out.add_paragraph(text)
+
+def make_doc_from_units(units):
+    """
+    units:
+      ("paragraph", source_paragraph)
+      ("text", text)
+    """
+    out = Document()
+    clear_default_paragraph(out)
+
+    for kind, obj in units:
+        if kind == "paragraph":
+            clone_paragraph(obj, out)
+        else:
+            add_text_paragraph(out, obj)
+
+    return out
+
+def paragraph_units(doc):
+    """
+    Mỗi paragraph là một đơn vị. Nếu paragraph quá dài so với
+    max_words thì chia thành các câu.
+    """
+    units = []
+
+    for p in doc.paragraphs:
+        text = p.text or ""
+
+        # Đoạn trống: giữ như một paragraph để không phá bố cục.
+        if not text.strip():
+            units.append(("paragraph", p, 0))
+            continue
+
+        wc = word_count(text)
+
+        if wc <= 0:
+            units.append(("paragraph", p, 0))
+        elif wc <= st.session_state.get("max_words", 5500):
+            units.append(("paragraph", p, wc))
+        else:
+            # Paragraph quá dài: tách theo câu.
+            sentences = split_sentences(text)
+            if len(sentences) <= 1:
+                units.append(("paragraph", p, wc))
+            else:
+                for s in sentences:
+                    units.append(("text", s, word_count(s)))
+
+    return units
+
+def build_chunks(doc, target, tolerance):
+    """
+    Chia gần target, trong khoảng target +/- tolerance.
+    Mỗi chunk ưu tiên kết thúc tại cuối paragraph/câu.
+    Thuật toán không chốt quá sớm chỉ vì một paragraph nhỏ.
+    """
+    min_words = max(1, target - tolerance)
+    max_words = target + tolerance
+
+    # Dùng session_state chỉ để paragraph_units biết max.
+    st.session_state["max_words"] = max_words
+    units = paragraph_units(doc)
+
+    chunks = []
+    current = []
+    current_words = 0
+
+    for item in units:
+        kind, obj, wc = item
+
+        # Paragraph trống: chỉ giữ trong chunk hiện tại nếu chunk có nội dung.
+        if wc == 0:
+            if current:
+                current.append((kind, obj))
+            continue
+
+        # Nếu đã đạt tối thiểu và thêm đơn vị này vượt max,
+        # chốt chunk hiện tại trước.
+        if current and current_words >= min_words and current_words + wc > max_words:
+            chunks.append(current)
+            current = []
+            current_words = 0
+
+        current.append((kind, obj))
+        current_words += wc
+
+        # Nếu đã đạt target, chỉ chốt ngay nếu:
+        # - đã vượt/đạt max; hoặc
+        # - đơn vị tiếp theo sẽ có nguy cơ vượt max.
+        # Việc này được xử lý ở đầu vòng lặp, nên không chốt sớm ở đây.
+
+    if current:
+        chunks.append(current)
+
     return chunks
 
-def chunk_words(c):
-    return sum(u[3] for u in c)
+def chunk_count(chunk):
+    total = 0
+    for kind, obj in chunk:
+        total += word_count(obj.text if kind == "paragraph" else obj)
+    return total
+
+def export_chunk(chunk):
+    return make_doc_from_units([(kind, obj) for kind, obj, *_ in chunk])
+
+def prepare_zip(chunks):
+    buf = io.BytesIO()
+
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for idx, chunk in enumerate(chunks, 1):
+            doc = export_chunk(chunk)
+            dbuf = io.BytesIO()
+            doc.save(dbuf)
+            z.writestr(f"Chuong_{idx:03d}.docx", dbuf.getvalue())
+
+    return buf.getvalue()
+
+# ----------------------------
+# UI
+# ----------------------------
 
 st.title("📖 Tách truyện Word")
-st.write("Chia file Word thành các chương theo số từ, ưu tiên kết thúc ở cuối câu và giữ định dạng chữ.")
+st.caption("Chia một file Word thành các chương theo số từ bạn chọn, ưu tiên kết thúc ở cuối đoạn/câu.")
 
-f=st.file_uploader("Chọn file .docx", type=["docx"])
+uploaded = st.file_uploader(
+    "Chọn file truyện .docx",
+    type=["docx"],
+    help="File Word được xử lý trong phiên làm việc hiện tại.",
+)
 
-if f:
-    doc=Document(io.BytesIO(f.getvalue()))
-    total=sum(wc(p.text) for p in doc.paragraphs)
-    st.success(f"Đã đọc **{f.name}** — khoảng **{total:,} từ**.")
+if uploaded is None:
+    st.info("👆 Hãy tải file Word lên để bắt đầu.")
+    st.stop()
 
-    c1,c2=st.columns(2)
-    with c1:
-        target=st.number_input("Số từ mục tiêu / chương",100,100000,5000,100)
-    with c2:
-        tol=st.number_input("Dung sai ± từ",0,20000,500,100)
+try:
+    raw = uploaded.getvalue()
+    doc = Document(io.BytesIO(raw))
+except Exception as e:
+    st.error(f"Không thể đọc file Word: {e}")
+    st.stop()
 
-    min_w=max(1,target-tol); max_w=target+tol
-    st.info(f"Khoảng mục tiêu: **{min_w:,}–{max_w:,} từ/chương**. App ưu tiên cắt sau dấu câu.")
+total_words = sum(word_count(p.text) for p in doc.paragraphs)
 
-    if st.button("🔍 Phân tích & xem trước",use_container_width=True):
-        units=build_units(doc)
-        chunks=split_units(units,target,min_w,max_w)
-        st.session_state["chunks"]=chunks
-        st.session_state["source"]=f.name
+st.success(
+    f"Đã đọc **{uploaded.name}** · khoảng **{total_words:,} từ** · "
+    f"**{len(doc.paragraphs):,} đoạn văn**."
+)
 
-    if "chunks" in st.session_state:
-        chunks=st.session_state["chunks"]
-        st.subheader(f"📚 Dự kiến {len(chunks)} chương")
-        rows=[]
-        for i,c in enumerate(chunks,1):
-            n=chunk_words(c)
-            status="✓" if min_w<=n<=max_w else "⚠"
-            rows.append({"Chương":f"{i:03d}","Số từ":f"{n:,}","":status})
-        st.dataframe(rows,use_container_width=True,hide_index=True)
+st.subheader("⚙️ Cài đặt chia chương")
 
-        if st.button("✂️ Tách và tạo ZIP",type="primary",use_container_width=True):
-            buf=io.BytesIO()
-            with zipfile.ZipFile(buf,"w",zipfile.ZIP_DEFLATED) as z:
-                for i,c in enumerate(chunks,1):
-                    out=make_chunk_doc(c)
-                    b=io.BytesIO(); out.save(b)
-                    z.writestr(f"Chuong_{i:03d}.docx",b.getvalue())
-            buf.seek(0)
-            stem=Path(st.session_state["source"]).stem
-            st.download_button("⬇️ Tải ZIP",buf.getvalue(),f"{stem}_da_tach.zip","application/zip",use_container_width=True)
-            st.success("Đã tạo xong.")
+c1, c2 = st.columns(2)
+
+with c1:
+    target = st.number_input(
+        "Số từ mục tiêu / chương",
+        min_value=100,
+        max_value=50000,
+        value=5000,
+        step=100,
+    )
+
+with c2:
+    tolerance = st.number_input(
+        "Dung sai ± từ",
+        min_value=0,
+        max_value=10000,
+        value=500,
+        step=100,
+    )
+
+min_words = max(1, target - tolerance)
+max_words = target + tolerance
+
+st.info(
+    f"🎯 Mục tiêu: **{target:,} từ/chương** · "
+    f"Khoảng cho phép: **{min_words:,}–{max_words:,} từ**"
+)
+
+st.subheader("📋 Xem trước")
+
+if st.button("🔍 Tạo bản xem trước", use_container_width=True):
+    chunks = build_chunks(doc, target, tolerance)
+    st.session_state["chunks"] = chunks
+    st.session_state["target"] = target
+    st.session_state["tolerance"] = tolerance
+    st.session_state["source_name"] = uploaded.name
+    st.session_state.pop("zip_bytes", None)
+
+if "chunks" in st.session_state:
+    chunks = st.session_state["chunks"]
+    counts = [chunk_count(c) for c in chunks]
+
+    st.success(
+        f"Dự kiến **{len(chunks):,} chương** · "
+        f"Trung bình **{sum(counts)/len(counts):,.0f} từ/chương**."
+    )
+
+    # Bảng gọn, không tạo None.
+    rows = []
+    for i, wc in enumerate(counts, 1):
+        status = "✓" if min_words <= wc <= max_words else "⚠"
+        rows.append({"Chương": f"{i:03d}", "Số từ": f"{wc:,}", "Trạng thái": status})
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    if st.button("✂️ Tách và tạo ZIP", type="primary", use_container_width=True):
+        with st.spinner("Đang tạo các file Word..."):
+            zip_bytes = prepare_zip(chunks)
+
+        st.session_state["zip_bytes"] = zip_bytes
+
+        original = Path(st.session_state.get("source_name", "truyen.docx")).stem
+        st.session_state["zip_name"] = f"{original}_da_tach.zip"
+
+        st.success(
+            f"✅ Đã tạo xong **{len(chunks):,} file Word** "
+            f"({len(zip_bytes) / (1024 * 1024):.1f} MB)."
+        )
+
+    if "zip_bytes" in st.session_state:
+        st.download_button(
+            label="⬇️ TẢI FILE ZIP",
+            data=st.session_state["zip_bytes"],
+            file_name=st.session_state["zip_name"],
+            mime="application/zip",
+            use_container_width=True,
+        )
 
 st.divider()
-st.caption("V2: phù hợp với file truyện có nhiều dòng nằm trong cùng một paragraph; chia theo câu và sao chép định dạng run khi cắt giữa paragraph.")
+st.caption(
+    "V3: ưu tiên điểm kết thúc ở cuối paragraph/câu, không chốt quá sớm, "
+    "và giữ định dạng Word tốt nhất có thể."
+)
